@@ -1,11 +1,39 @@
 import { createInitialState } from './data';
-import type { ComponentSnapshot, ComponentSpec, ValidationIssue, WorkspaceState } from './types';
+import type {
+  ComponentSnapshot,
+  ComponentSpec,
+  EffectiveConclusion,
+  SubmitResult,
+  ValidationIssue,
+  WorkspaceState
+} from './types';
 
-const STORAGE_KEY = 'sologsb-1028-workspace-v1';
+const STORAGE_KEY = 'sologsb-1028-workspace-v2';
+
+/** 每个发布窗口的评审容量。 */
+export const REVIEW_CAPACITY = 3;
 
 const clone = <T>(value: T): T => structuredClone(value);
 const uid = (prefix: string) => `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 const signature = (component: ComponentSpec) => `${component.properties.map((item) => `${item.name}:${item.required}`).join('|')}::${component.interactionSignature}`;
+
+/** 由队列中已确认项推导各组件的最终生效结论（每个组件取最近一次确认）。 */
+const effectiveConclusionsFrom = (state: WorkspaceState): EffectiveConclusion[] => {
+  const latest = new Map<string, WorkspaceState['reviewQueue'][number]>();
+  for (const item of state.reviewQueue) {
+    if (item.status !== 'confirmed') continue;
+    const previous = latest.get(item.componentId);
+    if (!previous || (item.resolvedAt ?? '') >= (previous.resolvedAt ?? '')) latest.set(item.componentId, item);
+  }
+  return [...latest.values()].map((item) => ({
+    componentId: item.componentId,
+    componentName: item.componentName,
+    revision: item.revision,
+    queueItemId: item.id,
+    confirmedAt: item.resolvedAt ?? '',
+    content: clone(item.content)
+  }));
+};
 
 export class SpecStore extends EventTarget {
   state: WorkspaceState;
@@ -72,6 +100,7 @@ export class SpecStore extends EventTarget {
           example.staleReason = '组件交互或属性契约已修改，示例需要重新验证。';
         });
       }
+      this.withdrawQueuedFor(state, selected.id);
     });
   }
 
@@ -87,6 +116,7 @@ export class SpecStore extends EventTarget {
         defaultValue: '',
         description: '描述该属性对开发者和用户的影响。'
       });
+      this.withdrawQueuedFor(state, selected.id);
     });
   }
 
@@ -97,6 +127,7 @@ export class SpecStore extends EventTarget {
       const target = state.components.find((item) => item.id === selected.id);
       const property = target?.properties.find((item) => item.id === propertyId);
       if (target && property) Object.assign(property, patch);
+      this.withdrawQueuedFor(state, selected.id);
     });
   }
 
@@ -114,6 +145,7 @@ export class SpecStore extends EventTarget {
           example.staleReason = `属性 ${property.name} 已删除，示例代码或说明仍可能引用它。`;
         }
       });
+      this.withdrawQueuedFor(state, selected.id);
     });
   }
 
@@ -133,6 +165,7 @@ export class SpecStore extends EventTarget {
         staleReason: '',
         createdFromRevision: target.revision
       });
+      this.withdrawQueuedFor(state, selected.id);
     });
   }
 
@@ -143,6 +176,7 @@ export class SpecStore extends EventTarget {
       const target = state.components.find((item) => item.id === selected.id);
       const example = target?.examples.find((item) => item.id === exampleId);
       if (example) Object.assign(example, patch);
+      this.withdrawQueuedFor(state, selected.id);
     });
   }
 
@@ -152,6 +186,7 @@ export class SpecStore extends EventTarget {
     this.commit('删除示例', (state) => {
       const target = state.components.find((item) => item.id === selected.id);
       if (target) target.examples = target.examples.filter((item) => item.id !== exampleId);
+      this.withdrawQueuedFor(state, selected.id);
     });
   }
 
@@ -193,7 +228,170 @@ export class SpecStore extends EventTarget {
       target.interactionSignature = currentSignature.split('::')[1] ?? target.interactionSignature;
       target.revision += 1;
       target.updatedAt = new Date().toISOString();
+      this.withdrawQueuedFor(state, selected.id);
     });
+  }
+
+  get reviewQueue() { return this.state.reviewQueue; }
+  get currentWindow() { return this.state.windows.find((item) => item.id === this.state.currentWindowId); }
+  get releaseSnapshots() { return this.state.releaseSnapshots; }
+  get submissionFailures() { return this.state.submissionFailures; }
+
+  /** 最终生效结论：仅来自已确认的评审项，发布快照、版本差异和搜索都只读取它。 */
+  get effectiveConclusions(): EffectiveConclusion[] {
+    return effectiveConclusionsFrom(this.state);
+  }
+
+  effectiveConclusionFor(componentId: string): EffectiveConclusion | undefined {
+    return this.effectiveConclusions.find((item) => item.componentId === componentId);
+  }
+
+  inFlightFor(componentId: string) {
+    return this.state.reviewQueue.find(
+      (item) => item.componentId === componentId && (item.status === 'queued' || item.status === 'active')
+    );
+  }
+
+  lastFailureFor(componentId: string) {
+    return this.state.submissionFailures.find((item) => item.componentId === componentId);
+  }
+
+  /**
+   * 送审。先按当前契约重新核验属性与无障碍说明；
+   * 依赖示例失效或同组件已有在途评审时整次拒绝，草稿保留并记录失败原因。
+   */
+  submitForReview(): SubmitResult {
+    const selected = this.selected;
+    if (!selected) return { ok: false, reason: '未选择组件。' };
+    const contractErrors = this.validate().filter(
+      (issue) => issue.componentId === selected.id && issue.level === 'error'
+    );
+    const staleExamples = selected.examples.filter(
+      (example) =>
+        example.stale || example.propertyIds.some((id) => !selected.properties.some((property) => property.id === id))
+    );
+    const inFlight = this.inFlightFor(selected.id);
+    let reason = '';
+    if (contractErrors.length) {
+      reason = `属性或无障碍说明未通过当前契约核验：${contractErrors.map((issue) => issue.message).join(' ')}`;
+    } else if (staleExamples.length) {
+      reason = `依赖示例失效：${staleExamples.map((example) => example.title).join('、')}，请先迁移或修复示例。`;
+    } else if (inFlight) {
+      reason = `同一组件已有在途评审（${inFlight.status === 'active' ? '评审中' : '排队中'}），本次送审被整次拒绝。`;
+    }
+    if (reason) {
+      this.commit('送审被拒绝', (state) => {
+        state.submissionFailures.unshift({
+          id: uid('failure'),
+          componentId: selected.id,
+          componentName: selected.name,
+          reason,
+          at: new Date().toISOString()
+        });
+        state.submissionFailures = state.submissionFailures.slice(0, 30);
+      });
+      return { ok: false, reason };
+    }
+    this.commit('提交送审', (state) => {
+      const target = state.components.find((item) => item.id === selected.id);
+      if (!target) return;
+      const { snapshots: _ignored, ...content } = clone(target);
+      state.reviewQueue.push({
+        id: uid('review'),
+        componentId: target.id,
+        componentName: target.name,
+        revision: target.revision,
+        content,
+        status: 'queued',
+        submittedAt: new Date().toISOString(),
+        startedAt: null,
+        resolvedAt: null,
+        windowId: null,
+        note: ''
+      });
+      target.status = 'review';
+      target.updatedAt = new Date().toISOString();
+      this.promoteQueue(state);
+    });
+    const item = this.inFlightFor(selected.id);
+    return {
+      ok: true,
+      reason: item?.status === 'active' ? '已进入当前窗口评审。' : '窗口名额已满，按提交顺序排队等待。'
+    };
+  }
+
+  /** 确认或驳回评审中的项；已确认项此后不可被覆盖。 */
+  resolveReviewItem(itemId: string, outcome: 'confirmed' | 'rejected', note = '') {
+    this.commit(outcome === 'confirmed' ? '确认评审结论' : '驳回评审项', (state) => {
+      const item = state.reviewQueue.find((entry) => entry.id === itemId);
+      if (!item || item.status !== 'active') return;
+      item.status = outcome;
+      item.resolvedAt = new Date().toISOString();
+      item.note = note || (outcome === 'confirmed' ? '评审通过，结论已生效。' : '评审驳回，可修改后重新送审。');
+      const target = state.components.find((entry) => entry.id === item.componentId);
+      if (target) {
+        target.status = outcome === 'confirmed' ? 'published' : 'draft';
+        target.updatedAt = new Date().toISOString();
+      }
+      this.promoteQueue(state);
+    });
+  }
+
+  /** 切换发布窗口：未开始项顺延到新窗口并按原顺序补位，已确认项不受影响。 */
+  switchWindow() {
+    this.commit('切换发布窗口', (state) => {
+      const current = state.windows.find((item) => item.id === state.currentWindowId);
+      if (current) current.closedAt = new Date().toISOString();
+      const id = uid('window');
+      state.windows.push({
+        id,
+        label: `发布窗口 ${state.windows.length + 1}`,
+        capacity: REVIEW_CAPACITY,
+        startedAt: new Date().toISOString(),
+        closedAt: null
+      });
+      state.currentWindowId = id;
+      this.promoteQueue(state);
+    });
+  }
+
+  /** 发布快照只读取最终生效结论（已确认的评审项），不包含草稿或在途内容。 */
+  createReleaseSnapshot() {
+    this.commit('生成发布快照', (state) => {
+      state.releaseSnapshots.unshift({
+        id: uid('release'),
+        windowId: state.currentWindowId,
+        createdAt: new Date().toISOString(),
+        conclusions: effectiveConclusionsFrom(state)
+      });
+      state.releaseSnapshots = state.releaseSnapshots.slice(0, 12);
+    });
+  }
+
+  /** 同一组件再次修改时，撤回其未开始（排队中）的旧送审项；重新送审会排到队尾。 */
+  private withdrawQueuedFor(state: WorkspaceState, componentId: string) {
+    state.reviewQueue.forEach((item) => {
+      if (item.componentId === componentId && item.status === 'queued') {
+        item.status = 'withdrawn';
+        item.resolvedAt = new Date().toISOString();
+        item.note = '组件被再次修改，未开始的送审项已撤回；重新送审将排到队尾。';
+      }
+    });
+  }
+
+  /** 按提交顺序把排队项补进当前窗口的空余名额。 */
+  private promoteQueue(state: WorkspaceState) {
+    const window = state.windows.find((item) => item.id === state.currentWindowId);
+    if (!window) return;
+    let active = state.reviewQueue.filter((item) => item.status === 'active' && item.windowId === window.id).length;
+    for (const item of state.reviewQueue) {
+      if (active >= window.capacity) break;
+      if (item.status !== 'queued') continue;
+      item.status = 'active';
+      item.windowId = window.id;
+      item.startedAt = new Date().toISOString();
+      active += 1;
+    }
   }
 
   validate(): ValidationIssue[] {
@@ -271,7 +469,18 @@ export class SpecStore extends EventTarget {
   private load(): WorkspaceState {
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
-      if (saved) return JSON.parse(saved) as WorkspaceState;
+      if (saved) {
+        const parsed = JSON.parse(saved) as WorkspaceState;
+        const fallback = createInitialState();
+        return {
+          ...parsed,
+          reviewQueue: parsed.reviewQueue ?? [],
+          windows: parsed.windows?.length ? parsed.windows : fallback.windows,
+          currentWindowId: parsed.currentWindowId ?? fallback.currentWindowId,
+          releaseSnapshots: parsed.releaseSnapshots ?? [],
+          submissionFailures: parsed.submissionFailures ?? []
+        };
+      }
     } catch {
       // A corrupted local draft falls back to the bundled demo data.
     }

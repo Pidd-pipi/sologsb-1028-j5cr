@@ -1,4 +1,4 @@
-import type { ComponentSpec, WorkspaceState } from './types';
+import type { ComponentSpec, ReleaseWindow, WorkspaceState } from './types';
 
 const now = '2026-09-25T08:00:00.000Z';
 
@@ -110,7 +110,21 @@ const components: ComponentSpec[] = [
   }
 ];
 
-export const createInitialState = (): WorkspaceState => ({
-  components: structuredClone(components),
-  selectedId: components[0].id
-});
+export const createInitialState = (): WorkspaceState => {
+  const window: ReleaseWindow = {
+    id: 'window-1',
+    label: '发布窗口 1',
+    capacity: 3,
+    startedAt: now,
+    closedAt: null
+  };
+  return {
+    components: structuredClone(components),
+    selectedId: components[0].id,
+    reviewQueue: [],
+    windows: [window],
+    currentWindowId: window.id,
+    releaseSnapshots: [],
+    submissionFailures: []
+  };
+};

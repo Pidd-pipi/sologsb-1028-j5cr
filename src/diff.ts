@@ -1,4 +1,4 @@
-import type { ComponentSnapshot, ComponentSpec, DiffRow } from './types';
+import type { ComponentSnapshot, ComponentSpec, DiffRow, EffectiveConclusion } from './types';
 
 const selectedFields: Array<Exclude<keyof ComponentSpec, 'snapshots'>> = [
   'name', 'category', 'status', 'purpose', 'usage', 'states', 'keyboardBehavior', 'screenReader', 'disabledScenarios'
@@ -24,4 +24,15 @@ export function diffAgainstSnapshot(component: ComponentSpec, snapshot?: Compone
   const afterExamples = format(component.examples);
   if (beforeExamples !== afterExamples) rows.push({ field: 'examples', before: beforeExamples, after: afterExamples });
   return rows;
+}
+
+/** 版本差异只读取最终生效结论：当前草稿 vs 最近一次已确认的评审结论。 */
+export function diffAgainstEffective(component: ComponentSpec, conclusion?: EffectiveConclusion): DiffRow[] {
+  if (!conclusion) return [];
+  return diffAgainstSnapshot(component, {
+    revision: conclusion.revision,
+    savedAt: conclusion.confirmedAt,
+    reason: '最终生效结论',
+    component: conclusion.content
+  });
 }
