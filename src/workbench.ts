@@ -1,10 +1,21 @@
 import { LitElement, css, html, nothing, type TemplateResult } from 'lit';
 import { repeat } from 'lit/directives/repeat.js';
-import { diffAgainstSnapshot } from './diff';
-import { SpecStore } from './store';
-import type { ComponentExample, ComponentSpec, PreviewDensity, PreviewTheme, PropertySpec, ValidationIssue } from './types';
+import { diffAgainstSnapshot, diffSpecs } from './diff';
+import { SpecStore, WINDOW_CAPACITY } from './store';
+import type {
+  ComponentExample,
+  ComponentSpec,
+  FrozenSpec,
+  PreviewDensity,
+  PreviewTheme,
+  PropertySpec,
+  ReviewItem,
+  ReviewWindow,
+  ValidationIssue
+} from './types';
 
-type EditorTab = 'overview' | 'api' | 'accessibility' | 'examples' | 'history';
+type EditorTab = 'overview' | 'api' | 'accessibility' | 'examples' | 'review' | 'history';
+type ReviewBadge = ReviewItem['status'];
 
 export class SpecA11yWorkbench extends LitElement {
   static properties = {
@@ -13,7 +24,8 @@ export class SpecA11yWorkbench extends LitElement {
     previewTheme: { state: true },
     previewDensity: { state: true },
     toast: { state: true },
-    showValidation: { state: true }
+    showValidation: { state: true },
+    snapshotWindowId: { state: true }
   };
 
   private store = new SpecStore();
@@ -23,6 +35,7 @@ export class SpecA11yWorkbench extends LitElement {
   private previewDensity: PreviewDensity = 'regular';
   private toast = '';
   private showValidation = true;
+  private snapshotWindowId = '';
   private toastTimer?: number;
 
   static styles = css`
@@ -114,6 +127,12 @@ export class SpecA11yWorkbench extends LitElement {
     .after { color: var(--spectrum-green-900); white-space: pre-wrap; }
     pre { white-space: pre-wrap; word-break: break-word; background: #202020; color: #f5f5f5; padding: 12px; border-radius: 8px; font-size: 12px; }
     .search-empty { padding: 20px 8px; color: var(--spectrum-gray-700); font-size: 13px; }
+    .review-list { display: grid; gap: 8px; margin-top: 8px; }
+    .review-card { border: 1px solid var(--spectrum-gray-300); border-radius: 10px; padding: 10px 12px; background: var(--spectrum-gray-75, var(--spectrum-gray-100)); }
+    .queue-panel h3 { margin: 14px 0 4px; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }
+    .muted { color: var(--spectrum-gray-700); font-size: 12px; margin: 4px 0; }
+    .linklike { cursor: pointer; font-size: 12px; color: var(--spectrum-blue-800); }
+    .pill.draft { background: var(--spectrum-red-300, var(--spectrum-gray-300)); }
     .footer-hint { position: fixed; bottom: 10px; left: 50%; transform: translateX(-50%); z-index: 30; background: #202020; color: white; border-radius: 999px; padding: 6px 12px; font-size: 11px; opacity: .9; }
     sp-toast { position: fixed; right: 18px; bottom: 18px; z-index: 50; }
     @media (max-width: 1180px) {
@@ -139,16 +158,24 @@ export class SpecA11yWorkbench extends LitElement {
   connectedCallback() {
     super.connectedCallback();
     this.store.addEventListener('change', this.onStoreChange);
+    this.store.addEventListener('state-changed', this.onStateChanged);
     window.addEventListener('keydown', this.onKeyDown);
+    if (!this.snapshotWindowId) this.snapshotWindowId = this.store.currentWindow?.id ?? '';
   }
 
   disconnectedCallback() {
     this.store.removeEventListener('change', this.onStoreChange);
+    this.store.removeEventListener('state-changed', this.onStateChanged);
     window.removeEventListener('keydown', this.onKeyDown);
   }
 
   private onStoreChange = () => {
     this.requestUpdate();
+  };
+
+  private onStateChanged = (event: Event) => {
+    const notice = (event as CustomEvent<{ notice?: string }>).detail?.notice;
+    if (notice) this.flash(notice);
   };
 
   private onKeyDown = (event: KeyboardEvent) => {
@@ -174,7 +201,7 @@ export class SpecA11yWorkbench extends LitElement {
       this.store.addComponent();
       return;
     }
-    const tabMap: Record<string, EditorTab> = { '1': 'overview', '2': 'api', '3': 'accessibility', '4': 'examples', '5': 'history' };
+    const tabMap: Record<string, EditorTab> = { '1': 'overview', '2': 'api', '3': 'accessibility', '4': 'examples', '5': 'review', '6': 'history' };
     if (event.altKey && tabMap[event.key]) {
       event.preventDefault();
       this.tab = tabMap[event.key];
@@ -192,12 +219,12 @@ export class SpecA11yWorkbench extends LitElement {
           <header>
             <div class="brand">
               <h1>Component Contract Studio</h1>
-              <p>规范、无障碍与示例失效追踪</p>
+              <p>规范、无障碍与发布评审排队</p>
             </div>
             <div class="toolbar">
               <sp-search
-                placeholder="搜索组件、属性、键盘行为或示例"
-                aria-label="全文搜索"
+                placeholder="搜索已生效结论：组件、属性、键盘行为或示例"
+                aria-label="生效结论全文搜索"
                 .value=${this.query}
                 @input=${(event: Event) => { this.query = (event.currentTarget as HTMLInputElement & { value?: string }).value ?? ''; }}
               ></sp-search>
@@ -222,17 +249,18 @@ export class SpecA11yWorkbench extends LitElement {
                     </span>
                     <span class="item-meta">${item.category} · ${item.properties.length} 个属性 · ${item.examples.length} 个示例</span>
                   </button>
-                `) : html`<div class="search-empty">没有匹配的组件。可尝试属性名、键盘行为或代码文本。</div>`}
+                `) : html`<div class="search-empty">没有匹配的已发布组件。搜索只覆盖评审通过后的最终生效结论，草稿与在途内容不会出现。</div>`}
               </div>
             </aside>
             <main class="main">${selected ? this.renderEditor(selected) : html`<div class="empty">新建或选择组件开始编辑。</div>`}</main>
             <aside class="inspector" aria-label="预览与检查">
+              ${this.renderReviewQueue()}
               ${this.renderPreview(selected)}
               ${this.renderValidation(selectedIssues)}
             </aside>
           </div>
           ${this.toast ? html`<sp-toast open variant="positive" timeout="3000">${this.toast}</sp-toast>` : nothing}
-          <div class="footer-hint">⌘/Ctrl+Z 撤销 · ⇧⌘/Ctrl+Z 重做 · ⌘/Ctrl+K 搜索 · Alt+1–5 切换面板</div>
+          <div class="footer-hint">⌘/Ctrl+Z 撤销 · ⇧⌘/Ctrl+Z 重做 · ⌘/Ctrl+K 搜索 · Alt+1–6 切换面板</div>
         </div>
       </sp-theme>
     `;
@@ -246,13 +274,9 @@ export class SpecA11yWorkbench extends LitElement {
           <p>${component.purpose}</p>
         </div>
         <div class="actions">
-          <select aria-label="组件状态" .value=${component.status} @change=${(event: Event) => this.store.updateComponent({ status: (event.currentTarget as HTMLSelectElement).value as ComponentSpec['status'] })}>
-            <option value="draft">草稿</option>
-            <option value="review">待审</option>
-            <option value="published">已发布</option>
-          </select>
-          <sp-button variant="secondary" @click=${() => this.store.createSnapshot('编辑器保存')}>保存快照</sp-button>
-          ${this.hasStaleExamples(component) ? html`<sp-button variant="accent" @click=${() => { this.store.migrateExamples(); this.flash('示例已迁移到当前契约'); }}>迁移示例</sp-button>` : nothing}
+          <span class="pill ${component.status}">${this.statusLabel(component.status)}</span>
+          <sp-button variant="secondary" @click=${() => this.store.createSnapshot('编辑器保存')}>保存草稿快照</sp-button>
+          <sp-button variant="accent" @click=${() => this.submit()}>送审</sp-button>
         </div>
       </div>
       <div class="tabs" role="tablist" aria-label="编辑区域">
@@ -260,12 +284,14 @@ export class SpecA11yWorkbench extends LitElement {
         ${this.renderTab('api', '2 属性与状态')}
         ${this.renderTab('accessibility', '3 无障碍')}
         ${this.renderTab('examples', '4 示例')}
-        ${this.renderTab('history', '5 版本')}
+        ${this.renderTab('review', '5 发布评审')}
+        ${this.renderTab('history', '6 版本')}
       </div>
       ${this.tab === 'overview' ? this.renderOverview(component) : nothing}
       ${this.tab === 'api' ? this.renderApi(component) : nothing}
       ${this.tab === 'accessibility' ? this.renderAccessibility(component) : nothing}
       ${this.tab === 'examples' ? this.renderExamples(component) : nothing}
+      ${this.tab === 'review' ? this.renderReviewTab(component) : nothing}
       ${this.tab === 'history' ? this.renderHistory(component) : nothing}
     `;
   }
@@ -385,20 +411,46 @@ export class SpecA11yWorkbench extends LitElement {
   private renderHistory(component: ComponentSpec): TemplateResult {
     const snapshot = component.snapshots[0];
     const rows = diffAgainstSnapshot(component, snapshot);
+    const effective = this.store.effectiveSpec(component.id);
+    const effectiveRows = effective ? diffSpecs(effective, this.withoutMeta(component)) : [];
     return html`
       <section class="panel">
         <div class="property-head">
           <h2>版本与迁移</h2>
-          <sp-button size="s" variant="secondary" @click=${() => this.store.createSnapshot('历史面板保存')}>保存当前版本</sp-button>
+          <sp-button size="s" variant="secondary" @click=${() => this.store.createSnapshot('历史面板保存')}>保存当前草稿</sp-button>
         </div>
-        <p>当前为 r${component.revision}。最近快照：${snapshot ? `r${snapshot.revision} · ${new Date(snapshot.savedAt).toLocaleString('zh-CN')}` : '暂无'}。</p>
+        <p>当前草稿为 r${component.revision}。最近本地快照：${snapshot ? `r${snapshot.revision} · ${new Date(snapshot.savedAt).toLocaleString('zh-CN')}` : '暂无'}。</p>
+
+        <h3>与最终生效结论的差异</h3>
+        ${effective ? html`
+          <p class="muted">生效版本 r${effective.revision}${this.latestApproval(component.id) ? html`，评审通过时间：${new Date(this.latestApproval(component.id)!.decidedAt!).toLocaleString('zh-CN')}` : nothing}。版本差异只读取该冻结结论，不读取在途或草稿内容。</p>
+          ${effectiveRows.length ? this.renderDiffRows(effectiveRows) : html`<div class="issue info"><strong>草稿与生效结论一致</strong>没有待发布的字段变化。</div>`}
+        ` : html`<div class="empty">该组件尚无评审通过的生效结论，发布后即可对照版本差异。</div>`}
+
+        <h3 style="margin-top:18px">本地草稿快照</h3>
         ${snapshot ? html`
-          <h3>与最近快照的差异</h3>
-          ${rows.length ? html`<div class="diff">${rows.map((row) => html`<div class="diff-row"><b>${row.field}</b><span class="before">- ${row.before || '（空）'}</span><br /><span class="after">+ ${row.after || '（空）'}</span></div>`)}</div>` : html`<div class="issue info">当前内容与最近快照一致。</div>`}
-        ` : html`<div class="empty">保存一次版本后即可比较字段、属性和示例变化。</div>`}
-        ${this.hasStaleExamples(component) ? html`<div class="issue warning" style="margin-top: 14px"><strong>检测到待迁移示例</strong>迁移会保留代码内容，清理已删除属性引用并更新契约版本。<br /><button @click=${() => this.store.migrateExamples()}>立即迁移</button></div>` : nothing}
+          ${rows.length ? this.renderDiffRows(rows) : html`<div class="issue info">当前草稿与最近本地快照一致。</div>`}
+        ` : html`<div class="empty">保存一次草稿后即可比较字段、属性和示例变化。本地快照不参与发布。</div>`}
+        ${this.hasStaleExamples(component) ? html`<div class="issue warning" style="margin-top: 14px"><strong>检测到待迁移示例</strong>迁移会保留代码内容，清理已删除属性引用并更新契约版本。<br /><button @click=${() => { this.store.migrateExamples(); this.flash('示例已迁移到当前契约'); }}>立即迁移</button></div>` : nothing}
       </section>
     `;
+  }
+
+  private renderDiffRows(rows: ReturnType<typeof diffSpecs>): TemplateResult {
+    return html`<div class="diff">${rows.map((row) => html`<div class="diff-row"><b>${this.fieldLabel(row.field)}</b><span class="before">- ${row.before || '（空）'}</span><br /><span class="after">+ ${row.after || '（空）'}</span></div>`)}</div>`;
+  }
+
+  private fieldLabel(field: string): string {
+    return ({
+      name: '名称', category: '分类', status: '状态', purpose: '用途', usage: '使用规则', states: '状态说明',
+      keyboardBehavior: '键盘行为', screenReader: '读屏说明', disabledScenarios: '禁用场景',
+      properties: '属性契约', examples: '关联示例'
+    } as Record<string, string>)[field] ?? field;
+  }
+
+  private withoutMeta(component: ComponentSpec): FrozenSpec {
+    const { snapshots: _s, submitFailures: _f, ...rest } = component;
+    return rest;
   }
 
   private renderPreview(component?: ComponentSpec): TemplateResult {
@@ -440,7 +492,11 @@ export class SpecA11yWorkbench extends LitElement {
   private get filteredComponents(): ComponentSpec[] {
     const query = this.query.trim().toLowerCase();
     if (!query) return this.store.state.components;
-    return this.store.state.components.filter((component) => JSON.stringify(component).toLowerCase().includes(query));
+    // 搜索只读取最终生效结论：仅在最近一次评审通过的冻结契约内匹配。
+    return this.store.state.components.filter((component) => {
+      const effective = this.store.effectiveSpec(component.id);
+      return effective ? JSON.stringify(effective).toLowerCase().includes(query) : false;
+    });
   }
 
   private hasStaleExamples(component: ComponentSpec): boolean {
@@ -448,7 +504,174 @@ export class SpecA11yWorkbench extends LitElement {
   }
 
   private statusLabel(status: ComponentSpec['status']): string {
-    return { draft: '草稿', review: '待审', published: '已发布' }[status];
+    return { draft: '草稿', review: '在途', published: '已发布' }[status];
+  }
+
+  private reviewBadgeLabel(status: ReviewBadge): string {
+    return { waiting: '排队中', active: '评审中', approved: '已通过', rejected: '已驳回', withdrawn: '已撤回' }[status];
+  }
+
+  private windowLabel(id: string | null): string {
+    if (!id) return '等待窗口受理';
+    return this.store.state.windows.find((item) => item.id === id)?.label ?? '未知窗口';
+  }
+
+  private latestApproval(componentId: string): ReviewItem | undefined {
+    return this.store.reviewsFor(componentId).filter((item) => item.status === 'approved').sort((a, b) => b.sequence - a.sequence)[0];
+  }
+
+  private submit() {
+    const result = this.store.submitForReview();
+    if (!result.ok) {
+      this.tab = 'review';
+      this.flash('送审被整次拒绝，草稿与失败原因已保留');
+      return;
+    }
+    this.tab = 'review';
+    this.flash(result.queued ? `当前窗口 ${WINDOW_CAPACITY} 个名额已满，已按提交顺序排队` : '已受理进入当前发布窗口评审');
+  }
+
+  private renderReviewTab(component: ComponentSpec): TemplateResult {
+    const reviews = this.store.reviewsFor(component.id);
+    const precheck = this.store.precheck(component);
+    const inFlight = this.store.inFlightReview(component.id);
+    const effective = this.store.effectiveSpec(component.id);
+    return html`
+      <section class="panel">
+        <div class="property-head">
+          <h2>发布评审</h2>
+          <sp-button size="s" variant="accent" @click=${() => this.submit()}>送审</sp-button>
+        </div>
+
+        <div class="issue ${inFlight ? 'warning' : 'info'}">
+          <strong>${inFlight ? `存在在途评审：${this.reviewBadgeLabel(inFlight.status)}` : '当前没有在途评审'}</strong>
+          ${inFlight
+            ? html`依据 r${inFlight.revision} 冻结契约（${new Date(inFlight.submittedAt).toLocaleString('zh-CN')} 提交）。同组件再次送审会被整次拒绝；继续修改草稿不会覆盖该结论，排队项会自动撤回并重排到队尾。`
+            : '送审前会按当前契约重新核验属性、无障碍说明与示例依赖。'}
+        </div>
+
+        <h3>送审前核验（实时）</h3>
+        ${precheck.length ? html`
+          <p class="muted">以下问题存在时整次拒绝送审，草稿保留不被改动：</p>
+          ${precheck.map((reason) => html`<div class="issue error">${reason}</div>`)}
+        ` : html`<div class="issue info"><strong>核验通过</strong>属性契约、键盘/读屏说明与全部示例依赖均有效，可以送审。</div>`}
+
+        <h3 style="margin-top:16px">评审记录</h3>
+        ${reviews.length ? html`<div class="review-list">${reviews.map((review) => this.renderReviewRow(review))}</div>` : html`<div class="empty">该组件还没有送审记录。</div>`}
+
+        ${component.submitFailures.length ? html`
+          <h3 style="margin-top:16px">失败原因（草稿保留）</h3>
+          ${component.submitFailures.map((failure) => html`
+            <div class="issue error">
+              <strong>${failure.stage === 'precheck' ? '送审拒绝' : '评审驳回'} · r${failure.revision} · ${new Date(failure.at).toLocaleString('zh-CN')}</strong>
+              ${failure.reasons.map((reason) => html`<div>${reason}</div>`)}
+            </div>`)}
+        ` : nothing}
+        ${effective ? html`<p class="muted" style="margin-top:12px">最终生效结论：r${effective.revision}，已通过评审不可被后续修改覆盖。</p>` : nothing}
+      </section>
+    `;
+  }
+
+  private renderReviewRow(review: ReviewItem): TemplateResult {
+    const position = review.status === 'waiting' ? this.store.queuePosition(review.id) : 0;
+    return html`
+      <article class="review-card">
+        <div class="property-head">
+          <strong>#${review.sequence} · r${review.revision} · ${review.componentName}</strong>
+          <span class="pill ${review.status === 'approved' ? 'published' : review.status === 'rejected' || review.status === 'withdrawn' ? 'draft' : 'review'}">${this.reviewBadgeLabel(review.status)}${position ? ` · 队位 ${position}` : ''}</span>
+        </div>
+        <div class="muted">
+          提交于 ${new Date(review.submittedAt).toLocaleString('zh-CN')} · ${this.windowLabel(review.windowId)}
+          ${review.decidedAt ? html` · 结论时间 ${new Date(review.decidedAt).toLocaleString('zh-CN')}` : ''}
+        </div>
+        ${review.decideReason ? html`<div class="muted">结论说明：${review.decideReason}</div>` : nothing}
+        <div class="inline" style="margin-top:6px">
+          ${review.status === 'waiting'
+            ? html`<sp-button size="s" variant="secondary" @click=${() => this.store.withdrawReview(review.id)}>撤回排队项</sp-button>`
+            : nothing}
+          <details><summary class="linklike">查看送审时冻结契约</summary><pre>${JSON.stringify(review.spec, null, 2)}</pre></details>
+        </div>
+      </article>
+    `;
+  }
+
+  private renderReviewQueue(): TemplateResult {
+    const window = this.store.currentWindow;
+    const admitted = window ? this.store.state.reviews.filter((item) => item.windowId === window.id) : [];
+    const waiting = this.store.waitingReviews;
+    const activeReviews = this.store.state.reviews.filter((item) => item.status === 'active');
+    const windows = [...this.store.state.windows].reverse();
+    const selectedWindowId = this.snapshotWindowId || window?.id || windows[0]?.id || '';
+    const snapshot = selectedWindowId ? this.store.releaseSnapshot(selectedWindowId) : undefined;
+    return html`
+      <section class="panel queue-panel">
+        <div class="property-head">
+          <h2>发布窗口 · ${WINDOW_CAPACITY} 名额</h2>
+          <sp-button size="s" variant="secondary" @click=${() => { this.store.advanceWindow(); this.snapshotWindowId = this.store.currentWindow?.id ?? this.snapshotWindowId; }}>切换窗口</sp-button>
+        </div>
+        ${window ? html`
+          <p class="muted"><strong>${window.label}</strong>（${new Date(window.openedAt).toLocaleDateString('zh-CN')} 开启）<br/>
+          已受理 ${admitted.length}/${WINDOW_CAPACITY}：受理即占名额，驳回也不释放；满员后新送审排队等待下一窗口。</p>
+          <div class="review-list">
+            ${admitted.sort((a, b) => a.sequence - b.sequence).map((review) => this.renderQueueItem(review))}
+          </div>
+        ` : html`<div class="empty">没有开启中的窗口，下一次送审会自动开启新窗口。</div>`}
+
+        <h3>等待队列（FIFO）</h3>
+        ${waiting.length ? html`<div class="review-list">${waiting.map((review, index) => html`
+          <article class="review-card">
+            <div class="property-head">
+              <strong>${index + 1}. ${review.componentName} · r${review.revision}</strong>
+              <span class="pill review">队位 ${index + 1}</span>
+            </div>
+            <div class="muted">提交于 ${new Date(review.submittedAt).toLocaleString('zh-CN')}；窗口切换时未开始项按此顺序顺延。</div>
+          </article>`)}</div>` : html`<p class="muted">队列为空。</p>`}
+
+        ${activeReviews.length ? html`
+          <h3 style="margin-top:14px">评审中（切换窗口后留在原窗口出结论）</h3>
+          <div class="review-list">${activeReviews.map((review) => this.renderQueueItem(review))}</div>
+        ` : nothing}
+
+        <h3 style="margin-top:14px">发布快照（仅最终生效结论）</h3>
+        <label class="field full">
+          <select aria-label="选择发布窗口" .value=${selectedWindowId} @change=${(event: Event) => { this.snapshotWindowId = (event.currentTarget as HTMLSelectElement).value; }}>
+            ${windows.map((item: ReviewWindow) => html`<option value=${item.id}>${item.label}${item.closedAt ? '（已关闭）' : '（进行中）'}</option>`)}
+          </select>
+        </label>
+        ${snapshot ? html`
+          ${snapshot.approved.length ? html`
+            <div class="review-list">${snapshot.approved.map((entry) => html`
+              <article class="review-card">
+                <div class="property-head"><strong>${entry.componentName} · r${entry.revision}</strong><span class="pill published">生效</span></div>
+                <div class="muted">通过于 ${new Date(entry.decidedAt).toLocaleString('zh-CN')}${entry.decideReason ? html` · ${entry.decideReason}` : ''}</div>
+              </article>`)}</div>
+            <details style="margin-top:8px"><summary class="linklike">查看快照 JSON</summary><pre>${JSON.stringify(snapshot, null, 2)}</pre></details>
+            <sp-button size="s" variant="secondary" style="margin-top:8px" @click=${() => this.copy(JSON.stringify(snapshot, null, 2))}>复制快照 JSON</sp-button>
+          ` : html`<p class="muted">该窗口尚无评审通过项，发布快照为空。驳回与排队内容不会进入快照。</p>`}
+        ` : nothing}
+      </section>
+    `;
+  }
+
+  private renderQueueItem(review: ReviewItem): TemplateResult {
+    return html`
+      <article class="review-card">
+        <div class="property-head">
+          <strong>${review.componentName} · r${review.revision}</strong>
+          <span class="pill ${review.status === 'approved' ? 'published' : review.status === 'rejected' ? 'draft' : 'review'}">${this.reviewBadgeLabel(review.status)}</span>
+        </div>
+        <div class="muted">提交于 ${new Date(review.submittedAt).toLocaleString('zh-CN')}${review.decidedAt ? html`；${new Date(review.decidedAt).toLocaleString('zh-CN')} 出结论` : ''}</div>
+        ${review.decideReason ? html`<div class="muted">${review.decideReason}</div>` : nothing}
+        ${review.status === 'active' ? html`
+          <div class="inline" style="margin-top:6px;flex-wrap:wrap">
+            <sp-button size="s" variant="accent" @click=${() => this.store.decideReview(review.id, true, '契约与无障碍说明核验通过。')}>通过</sp-button>
+            <sp-button size="s" variant="secondary" @click=${() => {
+              const reason = window.prompt('驳回原因（会保留在失败记录中）', '契约或无障碍说明不满足发布要求。');
+              if (reason !== null) this.store.decideReview(review.id, false, reason || '评审未通过。');
+            }}>驳回</sp-button>
+          </div>` : nothing}
+      </article>
+    `;
   }
 
   private async copy(value: string) {

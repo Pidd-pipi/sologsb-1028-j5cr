@@ -1,6 +1,11 @@
-import type { ComponentSpec, WorkspaceState } from './types';
+import type { ComponentSpec, FrozenSpec, ReviewItem, ReviewWindow, WorkspaceState } from './types';
 
 const now = '2026-09-25T08:00:00.000Z';
+
+const freezeOf = (component: ComponentSpec, overrides: Partial<FrozenSpec> = {}): FrozenSpec => {
+  const { snapshots: _snapshots, submitFailures: _failures, ...rest } = component;
+  return { ...structuredClone(rest), ...overrides };
+};
 
 const components: ComponentSpec[] = [
   {
@@ -42,7 +47,8 @@ const components: ComponentSpec[] = [
     ],
     revision: 3,
     updatedAt: now,
-    snapshots: []
+    snapshots: [],
+    submitFailures: []
   },
   {
     id: 'field-spec',
@@ -50,7 +56,7 @@ const components: ComponentSpec[] = [
     category: 'Forms',
     status: 'review',
     purpose: '收集单行文本，并始终向所有用户暴露字段名称。',
-    usage: '标签放在输入框上方；帮助文本解释格式，错误文本说明修复方式。',
+    usage: '标签放在输入框上方；帮助文本解释格式，错误文本说明错误修复方式。',
     properties: [
       { id: 'p-field-label', name: 'label', type: 'string', required: true, defaultValue: '组件名称', description: '字段可见标签，并关联输入框。' },
       { id: 'p-field-required', name: 'required', type: 'boolean', required: false, defaultValue: 'false', description: '标记必填；提交后再显示错误。' },
@@ -74,7 +80,8 @@ const components: ComponentSpec[] = [
     ],
     revision: 2,
     updatedAt: now,
-    snapshots: []
+    snapshots: [],
+    submitFailures: []
   },
   {
     id: 'dialog-spec',
@@ -106,11 +113,82 @@ const components: ComponentSpec[] = [
     ],
     revision: 2,
     updatedAt: now,
-    snapshots: []
+    snapshots: [],
+    // r1 送审曾被驳回；驳回后维护者改到 r2，示例随之失效，重新送审会被整次拒绝。
+    submitFailures: [
+      {
+        id: 'failure-dialog-r1',
+        at: '2026-09-22T10:30:00.000Z',
+        revision: 1,
+        stage: 'review',
+        reasons: ['缺少关闭后焦点恢复到触发元素的说明，请补充后重新送审。']
+      }
+    ]
+  }
+];
+
+const window202609: ReviewWindow = {
+  id: 'window-2026-09',
+  label: '2026 年 9 月发布窗口',
+  openedAt: '2026-09-01T00:00:00.000Z'
+};
+
+const reviews: ReviewItem[] = [
+  {
+    id: 'review-button-r3',
+    componentId: 'button-spec',
+    componentName: 'Action button',
+    sequence: 1,
+    status: 'approved',
+    windowId: 'window-2026-09',
+    revision: 3,
+    submittedAt: '2026-09-10T09:00:00.000Z',
+    decidedAt: '2026-09-12T15:00:00.000Z',
+    decideReason: '契约与示例一致，准予发布。',
+    spec: freezeOf(components[0])
+  },
+  {
+    id: 'review-field-r2',
+    componentId: 'field-spec',
+    componentName: 'Labelled field',
+    sequence: 2,
+    status: 'active',
+    windowId: 'window-2026-09',
+    revision: 2,
+    submittedAt: '2026-09-18T09:30:00.000Z',
+    spec: freezeOf(components[1])
+  },
+  {
+    // 占住第三个名额：驳回项在窗口关闭前不释放名额。
+    id: 'review-dialog-r1',
+    componentId: 'dialog-spec',
+    componentName: 'Modal dialog',
+    sequence: 3,
+    status: 'rejected',
+    windowId: 'window-2026-09',
+    revision: 1,
+    submittedAt: '2026-09-20T14:00:00.000Z',
+    decidedAt: '2026-09-22T10:30:00.000Z',
+    decideReason: '缺少关闭后焦点恢复到触发元素的说明。',
+    spec: freezeOf(components[2], {
+      revision: 1,
+      examples: [{
+        id: 'example-dialog-modal',
+        title: '删除确认',
+        code: '<sp-dialog open modal heading="删除组件？">\n  <sp-button slot="button" variant="negative">删除</sp-button>\n</sp-dialog>',
+        propertyIds: ['p-dialog-open', 'p-dialog-title', 'p-dialog-modal'],
+        stale: false,
+        staleReason: '',
+        createdFromRevision: 1
+      }]
+    })
   }
 ];
 
 export const createInitialState = (): WorkspaceState => ({
   components: structuredClone(components),
-  selectedId: components[0].id
+  selectedId: components[0].id,
+  windows: [structuredClone(window202609)],
+  reviews: structuredClone(reviews),
+  queueSequence: 4
 });
